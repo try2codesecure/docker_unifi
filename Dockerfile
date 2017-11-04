@@ -1,77 +1,117 @@
-FROM debian:jessie
-  # WORKING: ends up being 500MB+
-# FROM openjdk:8-jdk
-  # openjdk:8-jdk might sound like a good alternative, currently based on debian jessie, but Docker could switch that to apline some day? It's 600MB+!!
-# FROM debian:jessie-slim
-  # NOT WORKING. seems to cause issues when installing openjdk when update-alternatives tries to link a man page and breaks just because man pages are not installed. `--force-all` might work arround it, but that's a hack... :-/
-
+FROM debian:stretch-slim
+  # WORKING: work around openjdk issue which expects the man-page directory, failing to configure package if it doesn't
+# FROM debian:stretch-slim
+  # needs minor fixes to get working but results in much larger image
 MAINTAINER Jacob Alberty <jacob.alberty@foundigital.com>
 
-ENV DEBIAN_FRONTEND noninteractive \
-  container=docker
+ARG DEBIAN_FRONTEND=noninteractive
 
-ENV PKGURL=https://dl.ubnt.com/unifi/5.4.11/unifi_sysvinit_all.deb
-
-# Need backports for openjdk-8
-RUN echo "deb http://deb.debian.org/debian/ jessie-backports main" > /etc/apt/sources.list.d/10backports.list && \
-  echo "deb http://www.ubnt.com/downloads/unifi/debian unifi5 ubiquiti" > /etc/apt/sources.list.d/20ubiquiti.list && \
-  apt-key adv --keyserver keyserver.ubuntu.com --recv C0A52C50
-  # rather stick to what ubiquity themselves likely test with
-  #echo "deb http://downloads-distro.mongodb.org/repo/debian-sysvinit dist 10gen" > \
-  #/etc/apt/sources.list.d/21mongodb.list && \
-  #apt-key adv --keyserver keyserver.ubuntu.com --recv 7F0CEB10
-
-# Push installing openjdk-8-jre first, so that the unifi package doesn't pull in openjdk-7-jre as a dependency? Else uncomment and just go with openjdk-7.
-RUN apt-get clean && \
-  apt-get update && \
-  apt-get install -qy --no-install-recommends curl gdebi-core && \
-  apt-get install -t jessie-backports -qy --no-install-recommends \
-    ca-certificates-java \
-    openjdk-8-jre-headless && \
-  curl -o ./unifi.deb ${PKGURL} && \
-  yes | gdebi ./unifi.deb && \
-  rm -f ./unifi.deb && \
-  apt-get purge -qy --auto-remove curl gdebi-core && \
-  apt-get clean -qy && \
-  rm -rf /var/lib/apt/lists/*
-
-ADD 'https://github.com/Yelp/dumb-init/releases/download/v1.2.0/dumb-init_1.2.0_amd64.deb' /tmp/dumb-init_1.2.0_amd64.deb
-RUN  dpkg -i /tmp/dumb-init_*.deb && \
-  rm /tmp/dumb-init_*.deb
+ENV PKGURL=https://dl.ubnt.com/unifi/5.6.20/unifi_sysvinit_all.deb
 
 ENV BASEDIR=/usr/lib/unifi \
-  DATADIR=/var/lib/unifi \
-  RUNDIR=/var/run/unifi \
-  LOGDIR=/var/log/unifi \
-  JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64 \
-  JVM_MAX_HEAP_SIZE=1024M \
-  JVM_INIT_HEAP_SIZE=
+    DATADIR=/unifi/data \
+    LOGDIR=/unifi/log \
+    CERTDIR=/unifi/cert \
+    RUNDIR=/var/run/unifi \
+    ODATADIR=/var/lib/unifi \
+    OLOGDIR=/var/log/unifi \
+    GOSU_VERSION=1.10 \
+    BIND_PRIV=true \
+    RUNAS_UID0=true \
+    UNIFI_GID=999 \
+    UNIFI_UID=999
 
-RUN ln -s ${BASEDIR}/data ${DATADIR} && \
-  ln -s ${BASEDIR}/run ${RUNDIR} && \
-  ln -s ${BASEDIR}/logs ${LOGDIR}
-# Can't use env var, RUN doesn't support them?
+# Install gosu
+# https://github.com/tianon/gosu/blob/master/INSTALL.md
+# This should be integrated with the main run because it duplicates a lot of the steps there
+# but for now while shoehorning gosu in it is seperate
+RUN set -ex \
+    && fetchDeps=' \
+        ca-certificates \
+        dirmngr \
+        gpg \
+        wget \
+    ' \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends $fetchDeps \
+    && dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')" \
+    && wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch" \
+    && wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc" \
+# verify the signature
+    && export GNUPGHOME="$(mktemp -d)" \
+    && for server in $(shuf -e ha.pool.sks-keyservers.net \
+                            hkp://p80.pool.sks-keyservers.net:80 \
+                            keyserver.ubuntu.com \
+                            hkp://keyserver.ubuntu.com:80 \
+                            pgp.mit.edu) ; do \
+        gpg --keyserver "$server" --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4 && break || : ; \
+    done \
+    && gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu \
+    && rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc \
+    && chmod +x /usr/local/bin/gosu \
+# verify that the binary works
+    && gosu nobody true \
+    && apt-get purge -y --auto-remove $fetchDeps \
+    && rm -rf /var/lib/apt/lists/*
 
-VOLUME ["${DATADIR}", "${RUNDIR}", "${LOGDIR}"]
-# not sure if "/usr/lib/unifi/work" is needed as well?
 
-#EXPOSE 6789/tcp 8080/tcp 8081/tcp 8443/tcp 8843/tcp 8880/tcp 3478/udp
+# Push installing openjdk-8-jre first, so that the unifi package doesn't pull in openjdk-7-jre as a dependency? Else uncomment and just go with openjdk-7.
+RUN mkdir -p /usr/share/man/man1/ \
+ && groupadd -r unifi -g $UNIFI_GID \
+ && useradd --no-log-init -r -u $UNIFI_UID -g $UNIFI_GID unifi \
+ && apt-get update \
+ && apt-get install -qy --no-install-recommends \
+    curl \
+    dirmngr \
+    gnupg \
+    openjdk-8-jre-headless \
+    procps \
+    libcap2-bin \
+ && echo "deb http://www.ubnt.com/downloads/unifi/debian unifi5 ubiquiti" > /etc/apt/sources.list.d/20ubiquiti.list \
+ && apt-key adv --keyserver keyserver.ubuntu.com --recv C0A52C50 \
+ && curl -L -o ./unifi.deb "${PKGURL}" \
+ && apt -qy install ./unifi.deb \
+ && apt-get -qy purge --auto-remove \
+    dirmngr \
+    gnupg \
+ && rm -f ./unifi.deb \
+ && chown -R unifi:unifi /usr/lib/unifi \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN rm -rf ${ODATADIR} ${OLOGDIR} \
+ && mkdir -p ${DATADIR} ${LOGDIR} \
+ && ln -s ${DATADIR} ${BASEDIR}/data \
+ && ln -s ${RUNDIR} ${BASEDIR}/run \
+ && ln -s ${LOGDIR} ${BASEDIR}/logs \
+ && rm -rf {$ODATADIR} ${OLOGDIR} \
+ && ln -s ${DATADIR} ${ODATADIR} \
+ && ln -s ${LOGDIR} ${OLOGDIR} \
+ && mkdir -p /var/cert ${CERTDIR} \
+ && ln -s ${CERTDIR} /var/cert/unifi
+
+VOLUME ["/unifi", "${RUNDIR}"]
+
 EXPOSE 6789/tcp 8080/tcp 8443/tcp 8880/tcp 8843/tcp 3478/udp
 
-## Uncommenting these allows unifi to run as user nobody but I don't know for sure that all features #work so leaving commented out for now
-#RUN chown -R nobody:nogroup /usr/lib/unifi && \
-#    chown -R nobody:nogroup /var/lib/unifi && \
-#    chown -R nobody:nogroup /var/log/unifi && \
-#    chown -R nobody:nogroup /var/run/unifi
-#USER nobody
-COPY unifi.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/unifi.sh
+RUN mkdir -p /usr/unifi \
+     /usr/local/unifi/init.d \
+     /usr/unifi/init.d
+COPY docker-entrypoint.sh /usr/local/bin/
+COPY docker-healthcheck.sh /usr/local/bin/
+COPY functions /usr/unifi/functions
+COPY import_cert /usr/unifi/init.d/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+ && chmod +x /usr/unifi/init.d/import_cert \
+ && chmod +x /usr/local/bin/docker-healthcheck.sh
 
-WORKDIR /var/lib/unifi
+WORKDIR /unifi
 
-# execute controller using JSVC like orignial debian package does
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
-CMD ["/usr/local/bin/unifi.sh"]
+HEALTHCHECK CMD /usr/local/bin/docker-healthcheck.sh || exit 1
+
+# execute controller using JSVC like original debian package does
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+CMD ["unifi"]
 
 # execute the conroller directly without using the service
 #ENTRYPOINT ["/usr/bin/java", "-Xmx${JVM_MAX_HEAP_SIZE}", "-jar", "/usr/lib/unifi/lib/ace.jar"]
